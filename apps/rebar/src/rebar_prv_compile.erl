@@ -23,20 +23,12 @@
 
 -spec init(rebar_state:t()) -> {ok, rebar_state:t()}.
 init(State) ->
-    State1 = rebar_state:add_provider(State, providers:create([{name, ?PROVIDER},
-                                                               {module, ?MODULE},
-                                                               {bare, true},
-                                                               {deps, ?DEPS},
-                                                               {example, "rebar3 compile"},
-                                                               {short_desc, "Compile apps .app.src and .erl files."},
-                                                               {desc, "Compile apps .app.src and .erl files."},
-                                                               {opts, [{deps_only, $d, "deps_only", undefined,
-                                                                        "Only compile dependencies, no project apps will be built."}]}])),
+    State1 = rebar_state:add_provider(State, providers:create(cmd_opts())),
     {ok, State1}.
 
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
-    IsDepsOnly = is_deps_only(State),
+    {IsDepsOnly, Apps, IsDirectOnly} = handle_args(State),
     rebar_paths:set_paths([deps], State),
 
     Providers = rebar_state:providers(State),
@@ -49,21 +41,42 @@ do(State) ->
                  true ->
                      State0;
                  false ->
-                     handle_project_apps(Providers, State0)
+                     handle_specific_apps(Providers, State0, Apps, IsDirectOnly)
              end,
 
     rebar_paths:set_paths([plugins], State1),
 
     {ok, State1}.
 
-is_deps_only(State) ->
-    {Args, _} = rebar_state:command_parsed_args(State),
-    proplists:get_value(deps_only, Args, false).
+handle_specific_apps(Providers, State, [], _) ->
+    handle_project_apps(Providers, State, fun(_) -> true end, false);
+handle_specific_apps(Providers, State, Apps, IsDirectOnly) ->
+    Filter = fun(AppInfo) -> filter_name(AppInfo, Apps) end,
 
-handle_project_apps(Providers, State) ->
+    %% build any requested deps first
+    AllDeps = rebar_state:all_deps(State),
+    RequestedDeps = [Dep || Dep <- AllDeps, Filter(Dep)],
+    {ok, DepsToBuild} = case IsDirectOnly of
+                            true -> {ok, RequestedDeps};
+                          false -> rebar_digraph:compile_order(RequestedDeps, AllDeps)
+                        end,
+    CompiledDeps = build_deps(State, Providers, DepsToBuild),
+    State0 = rebar_state:merge_all_deps(State, CompiledDeps),
+
+    handle_project_apps(Providers, State0, Filter, IsDirectOnly).
+
+filter_name(AppInfo, Names) ->
+    Name = rebar_app_info:name(AppInfo),
+    lists:member(Name, Names).
+
+handle_project_apps(Providers, State, Filter, IsDirectOnly) ->
     Cwd = rebar_state:dir(State),
-    ProjectApps = rebar_state:project_apps(State),
-    {ok, ProjectApps1} = rebar_digraph:compile_order(ProjectApps),
+    AllApps = rebar_state:project_apps(State),
+    ProjectApps = [AppInfo || AppInfo <- AllApps, Filter(AppInfo)],
+    {ok, ProjectApps1} = case IsDirectOnly of
+                             true -> rebar_digraph:compile_order(ProjectApps);
+                             false -> rebar_digraph:compile_order(ProjectApps, AllApps)
+                         end,
 
     %% Run top level hooks *before* project apps compiled but *after* deps are
     rebar_hooks:run_all_hooks(Cwd, pre, ?PROVIDER, Providers, State),
@@ -123,6 +136,9 @@ pick_deps_to_build(State, MustBuild, All, Tag) ->
 
 copy_and_build_deps(State, Providers, MustBuildApps, AllApps) ->
     Apps = pick_deps_to_build(State, MustBuildApps, AllApps, apps),
+    build_deps(State, Providers, Apps).
+
+build_deps(State, Providers, Apps) ->
     Apps0 = [prepare_app(State, Providers, App) || App <- Apps],
     compile(State, Providers, Apps0, apps).
 
@@ -538,3 +554,32 @@ warn_on_problematic_directories(AllDirs) ->
 is_a_problem("eunit") -> true;
 is_a_problem("common_test") -> true;
 is_a_problem(_) -> false.
+
+cmd_opts() ->
+    [{name, ?PROVIDER},
+     {module, ?MODULE},
+     {bare, true},
+     {deps, ?DEPS},
+     {example, "rebar3 compile"},
+     {short_desc, "Compile apps .app.src and .erl files."},
+     {desc, "Compile apps .app.src and .erl files."},
+     {opts, [{deps_only, $d, "deps_only", undefined, "Only compile dependencies, no project apps will be built."},
+             {apps, undefined, "apps", string,
+              "Compile a specific list of apps and or deps and all of their dependencies"},
+             {direct_only, undefined, "direct-only", undefined,
+              "If apps option is used, only compile specified apps and ignore their deps"}]}].
+
+handle_args(State) ->
+    {Args, _} = rebar_state:command_parsed_args(State),
+    IsDepsOnly = proplists:get_value(deps_only, Args, false),
+    IsDirectOnly = proplists:get_value(direct_only, Args, false),
+    AppsRaw = proplists:get_value(apps, Args),
+    Apps = parse_apps(AppsRaw),
+    {IsDepsOnly, Apps, IsDirectOnly}.
+
+parse_apps(undefined) -> [];
+parse_apps(Bin) ->
+    case lists:usort(re:split(Bin, <<" *, *">>, [trim, unicode])) of
+        [<<"">>] -> []; % nothing submitted
+        Other -> Other
+    end.

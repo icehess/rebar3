@@ -3,6 +3,7 @@
 -module(rebar_digraph).
 
 -export([compile_order/1
+        ,compile_order/2
         ,restore_graph/1
         ,subgraph/2
         ,format_error/1]).
@@ -13,6 +14,12 @@
 -spec compile_order([rebar_app_info:t()]) ->
     {ok, [rebar_app_info:t()]} | {error, no_sort | {cycles, [[binary(),...]]}}.
 compile_order(Apps) ->
+    compile_order(Apps, Apps).
+
+%% @doc Sort apps with topological sort to get proper build order
+-spec compile_order([rebar_app_info:t()], [rebar_app_info:t()]) ->
+    {ok, [rebar_app_info:t()]} | {error, no_sort | {cycles, [[binary(),...]]}}.
+compile_order(Apps, AllApps) ->
     Graph = digraph:new(),
     lists:foreach(fun(App) ->
                           Name = rebar_app_info:name(App),
@@ -32,7 +39,7 @@ compile_order(Apps) ->
                         {error, {cycles, Cycles}}
                 end;
             V ->
-                {ok, names_to_apps(lists:reverse(V), Apps)}
+                {ok, names_to_apps(lists:reverse(V), AllApps)}
         end,
     true = digraph:delete(Graph),
     Order.
